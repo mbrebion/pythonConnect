@@ -57,3 +57,5 @@ answer = connect.askDevice(question, dest,timeout=3)
 # timout (2 by default) represent the max amount of time (in second) to wait for the answers
 # answer dict which keys are the devices names which were asked and the values, their answers. An ampty string is provided for each remote devices which dit not answered in time
 ```
+### Contributing
+As I'm not an expert in networking, any help will be appreciated to improve this library. 
