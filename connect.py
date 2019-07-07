@@ -11,7 +11,7 @@ import random
 ########### constants
 
 MULTICAST_ADDR = "239.255.4.3"
-ANNOUNCE_ALIVE_DELAY = 25 # time (in s) between advertizing, must be >=1 s)
+ANNOUNCE_ALIVE_DELAY = 30 # time (in s) between advertizing, must be >=1 s)
 TIMEOUT=1.5
 
 udpPort=3235
@@ -25,7 +25,7 @@ SEP=":,:"
 QUESTIONTAG="QuEsTiOn"
 ANSWERTAG="AnSwEr"
 MESSAGETAG= "MeSsAgE"
-
+PINGTAG= "PiNg"
 
 
 # udp advertizing tags
@@ -71,6 +71,22 @@ def _fa_template(self, question, sender):
     return ""
 
 
+
+################# FORMATING #################
+
+def _format( ins):
+    return (ins+TERM).encode('utf8')
+
+def _decode( ins):
+    clear=ins.decode('utf8')
+    if TERM in clear:
+        return clear.split(TERM)[0] # any following messages is dropped
+    else:
+        return -1
+
+############### MAIN CLASS ##################
+
+
 class Connect():
 
     instance=None
@@ -99,6 +115,7 @@ class Connect():
         self.myfuncError = fe
         self.myfuncAnswer = fa
         self.funcHostsUpdate = fhu
+
         self.alive = True
         self.answerLock = threading.Lock()
         self.answerAwaitedFrom = {}  ######### used for question/answers
@@ -115,16 +132,16 @@ class Connect():
         self.tcpThread.setDaemon(True)
         self.tcpThread.start()
 
-        # start udp multicast
-        self.udpThread = threading.Thread(target=self._dealWithAdvertizing)
-        self.udpThread.name = "UDP thread"
-        self.udpThread.setDaemon(True)
-        self.udpThread.start()
+        # start UDP
+        self.udpThread=None
+        self._restartUDP()
+
 
     # functions which may be called by the user
     def leavingNetwork(self):
-        self.my_recvsocket.settimeout(0.2)
-        self.my_sendSocket.settimeout(0.2)
+        if self.my_UdpSocket:
+            self.my_UdpSocket.settimeout(0.05)
+
         self.alive=False
 
     def askDevice(self, question, dest,timeout=2):
@@ -201,16 +218,20 @@ class Connect():
 
     def _removeRemoteDevice(self, name):
         if self._isConnected(name):
+
+            self.remoteDevices[name].writer.write(_format(MSG_QUIT_TCP)) ########## not sure about it
+
+            self.remoteDevices[name].writer.close()
+
             del self.remoteDevices[name]
-            self.asyncioClientWriters[name].close()
-            del self.asyncioClientWriters[name]
             self.funcHostsUpdate(self.remoteDevices)
             logging.info("connection stopped with " + str(name))
 
     def _addRemoteDevice(self, addr, name,connect=False):
-        self.remoteDevices[name] = addr
+        self.remoteDevices[name] = _remoteDevice(name,addr)
         # start tcp connection
         self.funcHostsUpdate(self.remoteDevices)
+
         if connect:
             asyncio.run_coroutine_threadsafe(self._connectToRemoteDevice(addr, name), self.asyncioLoop)
 
@@ -218,21 +239,34 @@ class Connect():
     ############# UDP advertizing #################
     ###############################################
 
+    def _restartUDP(self):
+        # start udp multicast
+        if  self.udpThread:
+            self.udpAlive = False
+            self.my_UdpSocket.settimeout(0.05)
+            if self.udpThread.isAlive():
+                self.udpThread.join()
+
+        self.udpAlive = True
+        self.udpThread = threading.Thread(target=self._dealWithAdvertizing)
+        self.udpThread.name = "UDP thread"
+        self.udpThread.setDaemon(True)
+        self.udpThread.start()
+
     def _sendUDP(self, kind, mess):
-        self.my_sendSocket.sendto((kind + SEP + mess).encode(), (self.multicast_ip, self.port))
+        self.my_UdpSocket.sendto((kind + SEP + mess).encode(), (self.multicast_ip, self.port))
 
     def _dealWithAdvertizing(self):
-        self.my_sendSocket = self._create_socket(self.multicast_ip, self.port + 1)
-        self.my_recvsocket = self._create_socket(self.multicast_ip, self.port)
+        self.my_UdpSocket = self._create_socket(self.multicast_ip, self.port)
 
         lastSent = time.time()
 
         # message sent two times (safer)
         self._sendUDP(MSG_HELLO, self.name)
-        time.sleep(0.01)
+        time.sleep(0.02)
         self._sendUDP(MSG_ALIVE, self.name)
 
-        while self.alive:
+        while self.alive and self.udpAlive :
 
             # announcing
             now = time.time()
@@ -243,11 +277,14 @@ class Connect():
             # listening
             try :
 
-                data, address = self.my_recvsocket.recvfrom(256)  # TODO : to be improved
+                data, address = self.my_UdpSocket.recvfrom(256)  # TODO : to be improved
                 data = data.decode()
                 kind, name = data.split(SEP)
+                now=time.time()
+                logging.debug("received HRU from " + name)
+
                 if name == self.name:
-                    # we dn't want to talk with ourself
+                    # we don't want to talk with ourself
                     continue
 
                 if kind == MSG_ALIVE or MSG_HELLO:
@@ -255,14 +292,17 @@ class Connect():
 
                     if not self._isConnected(name):
                         self._sendUDP(MSG_ALIVE, self.name)
-
                         self._addRemoteDevice(address,name,name > self.name)
+                        self.remoteDevices[name]._seen(now)
+                    else :
+                        self.remoteDevices[name].addr=address
+                        self.remoteDevices[name]._seen(now)
 
             except socket.timeout:
                 pass
 
-        self.my_sendSocket.close()
-        self.my_recvsocket.close()
+
+        self.my_UdpSocket.close()
 
     def _get_local_ip(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -327,6 +367,8 @@ class Connect():
     ############## TCP messaging ##################
     ###############################################
 
+    ####### functions called from outside asyncio
+
     def _dealWithMessaging(self):
 
         self.asyncioloopCreated = False
@@ -334,18 +376,24 @@ class Connect():
         self.asyncioExecutor = ThreadPoolExecutor(max_workers=1)
         asyncio.run(self._main())
 
-    def _format(self, ins):
-        return (ins+TERM).encode('utf8')
+    def _checkRemotesAreStillConnected(self,now):
+        """
+        Deal with remote devices and check wether they are still connected or not
+        :param now:
+        :return:
+        """
+        toClose=[]
 
-    def _decode(self, ins):
-        clear=ins.decode('utf8')
-        if TERM in clear:
-            return clear.split(TERM)[0] # any following messages is dropped
-        else:
-            return -1
+        for remoteName in self.remoteDevices.keys():
+            remote=self.remoteDevices[remoteName]
+            if now-remote.lastSeen() >  ANNOUNCE_ALIVE_DELAY*2:
+                self._tcpSend_from_outside(remoteName,PINGTAG)
 
+            elif now-remote.lastSeen() > ANNOUNCE_ALIVE_DELAY *5:
+                toClose.append(remoteName)
 
-    ####### functions called from outside asyncio
+        for elem in toClose:
+            self._removeRemoteDevice(elem)
 
     def _tcpSend_from_outside(self, name, message, wait=False):
         """
@@ -354,9 +402,13 @@ class Connect():
         :param message: message to be sent
         :return:
         """
-        future = asyncio.run_coroutine_threadsafe(self._tcpSendAS(name, message), self.asyncioLoop)
+        if not self._isConnected(name):
+            return False
+
+        future = asyncio.run_coroutine_threadsafe(self.remoteDevices[name]._tcpSendAS(message), self.asyncioLoop)
         if wait:
             future.result()
+        return True
 
     def _callback(self, future):
         if future.exception():
@@ -374,29 +426,23 @@ class Connect():
 
             # server might be stopped by calling shutdown from ANOTHER thread (else : deadlock)
 
-    async def _completeRead(self, reader):
-        clear = -1
-        data=b""
-        count=0
-        while clear == -1 and count<4:
-            partial = await reader.read(128)
-            data =data + partial
-            clear=self._decode(data)
-            count = count+1
-
-        return clear
-
     async def _handleClient(self, reader, writer):
 
         # exchange of names
-        writer.write(self._format(self.name))
-        clientName = await self._completeRead(reader) # first thing received is the name of the client
+        writer.write(_format(self.name))
+        clientName = await _completeRead(reader) # first thing received is the name of the client
         self.asyncioClientWriters[clientName] = writer # writer is store to enable writing from outside of this function
         await writer.drain()
 
+        if clientName not in self.remoteDevices:
+            self.remoteDevices[clientName]= _remoteDevice(clientName,reader=reader,writer=writer)
+        else:
+            self.remoteDevices[clientName]._setReaderWriter(reader,writer)
+
+        remoteClient=self.remoteDevices[clientName]
 
         while self.alive :
-            data= await self._completeRead(reader)
+            data= await remoteClient._completeRead()
             if data == -1 or data == MSG_QUIT_TCP:
                 # in this case, a problem (disconnection happened, ... )
                 break
@@ -424,6 +470,12 @@ class Connect():
                 future.add_done_callback(self._callback)
                 await future
 
+            elif kind == PINGTAG :
+                # in this case, our MSG_ALIVE udp messages are not received anymore by the device called clientName
+                # and something must be done, such as restarting the udp stack
+                self._restartUDP()
+                logging.WARNING("ping received from "+clientName+ " (probably caused by a problem in UDP socket, which has been restarted")
+
 
         self._removeRemoteDevice(clientName)
 
@@ -436,29 +488,57 @@ class Connect():
         reader, writer = await asyncio.open_connection(addr[0], tcpPortServer)
         asyncio.run_coroutine_threadsafe(self._handleClient(reader, writer), self.asyncioLoop)
 
-    async def _tcpSendAS(self, name, message):
-        logging.debug("Sending " + str(message) + "    to " + str(name))
-        self.asyncioClientWriters[name].write(self._format(message))
-        await self.asyncioClientWriters[name].drain()
-
     async def _closeProperly(self):
 
         for key, value in self.asyncioClientWriters.items():
-            value.write(self._format(MSG_QUIT_TCP))
+            value.write(_format(MSG_QUIT_TCP))
             value.close()
         await self.asyncioLoop.shutdown_asyncgens()
         self.server.close()
         await self.server.wait_closed()
 
 
+async def _completeRead(reader):
+    clear = -1
+    data=b""
+    count=0
+    while clear == -1 and count<4:
+        partial = await reader.read(128)
+        data =data + partial
+        clear=_decode(data)
+        count = count+1
+
+    return clear
 
 
+################ HELPER CLASS ###################
 
 
+class _remoteDevice():
 
+    def __init__(self,name,addr=None,writer=None,reader=None,lastSeen=None):
+        self.name = name
+        self.addr = addr
+        self.writer = writer
+        self.reader = reader
+        self.lastSeen = lastSeen
+        if not lastSeen:
+            self.lastSeen=time.time()
 
+    def _setReaderWriter(self,reader,writer):
+        self.reader=reader
+        self.writer=writer
 
+    def _seen(self,lastSeen=None):
+        if not lastSeen:
+            self.lastSeen=time.time()
+        else:
+            self.lastSeen=lastSeen
 
+    async def _completeRead(self):
+        return await _completeRead(self.reader)
 
-
-
+    async def _tcpSendAS(self,  message):
+        logging.debug("Sending " + str(message) + "    to " + str(self.name))
+        self.writer.write(_format(message))
+        await self.writer.drain()
